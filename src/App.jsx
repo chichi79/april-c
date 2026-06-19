@@ -535,17 +535,50 @@ function MarginCalculator({ data, setData }) {
 }
 
 // =========================================================
-// TAB: SALES (daily entry -> monthly auto aggregate)
+// TAB: SALES (daily bulk entry -> monthly / category reports)
 // =========================================================
 function SalesTracker({ data, setData, agg }) {
-  const [form, setForm] = useState({ productId: '', date: todayStr(), qty: '1', note: '' });
+  const [entryDate, setEntryDate] = useState(todayStr());
+  const [dayQtys, setDayQtys] = useState({});
   const [viewMonth, setViewMonth] = useState(thisMonthKey());
+  const [expandedDay, setExpandedDay] = useState(null);
+  const [categoryFilter, setCategoryFilter] = useState('전체');
 
-  function submit(e) {
-    e.preventDefault();
-    if (!form.productId || !form.qty) return;
-    setData({ ...data, sales: [...data.sales, { id: uid(), ...form, qty: Number(form.qty) }] });
-    setForm(f => ({ ...f, qty: '1', note: '' }));
+  const productsByCategory = useMemo(() => {
+    const map = new Map();
+    data.products.forEach(p => {
+      const cat = p.category || '미분류';
+      if (!map.has(cat)) map.set(cat, []);
+      map.get(cat).push(p);
+    });
+    for (const arr of map.values()) arr.sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+    return [...map.entries()].sort((a, b) => a[0].localeCompare(b[0], 'ko'));
+  }, [data.products]);
+
+  useEffect(() => {
+    const map = {};
+    data.products.forEach(p => {
+      const existing = data.sales.find(s => s.productId === p.id && s.date === entryDate);
+      map[p.id] = existing ? String(existing.qty) : '';
+    });
+    setDayQtys(map);
+  }, [entryDate, data.products, data.sales]);
+
+  function saveDayEntry() {
+    const otherSales = data.sales.filter(s => s.date !== entryDate);
+    const newSales = data.products
+      .filter(p => Number(dayQtys[p.id]) > 0)
+      .map(p => {
+        const existing = data.sales.find(s => s.productId === p.id && s.date === entryDate);
+        return {
+          id: existing?.id || uid(),
+          productId: p.id,
+          date: entryDate,
+          qty: Number(dayQtys[p.id]),
+          note: existing?.note || '',
+        };
+      });
+    setData({ ...data, sales: [...otherSales, ...newSales] });
   }
 
   function remove(id) {
@@ -555,22 +588,55 @@ function SalesTracker({ data, setData, agg }) {
   const monthSales = useMemo(() => {
     return agg.enrichedSales
       .filter(s => monthKeyOf(s.date) === viewMonth)
-      .sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-  }, [agg, viewMonth]);
+      .filter(s => categoryFilter === '전체' || (s.category || '미분류') === categoryFilter)
+      .sort((a, b) => (b.date || '').localeCompare(a.date || '') || a.productName.localeCompare(b.productName, 'ko'));
+  }, [agg, viewMonth, categoryFilter]);
 
   const dayRows = useMemo(() => {
     const map = new Map();
     monthSales.forEach(s => {
-      if (!map.has(s.date)) map.set(s.date, { revenue: 0, profit: 0, qty: 0 });
+      if (!map.has(s.date)) map.set(s.date, { revenue: 0, profit: 0, qty: 0, products: 0 });
       const acc = map.get(s.date);
-      acc.revenue += s.revenue; acc.profit += s.profit; acc.qty += Number(s.qty) || 0;
+      acc.revenue += s.revenue; acc.profit += s.profit; acc.qty += Number(s.qty) || 0; acc.products += 1;
     });
     return [...map.entries()].sort((a, b) => b[0].localeCompare(a[0]));
   }, [monthSales]);
 
-  const monthTotals = dayRows.reduce((acc, [, v]) => ({
-    revenue: acc.revenue + v.revenue, profit: acc.profit + v.profit, qty: acc.qty + v.qty,
+  const monthTotals = monthSales.reduce((acc, s) => ({
+    revenue: acc.revenue + s.revenue, profit: acc.profit + s.profit, qty: acc.qty + (Number(s.qty) || 0),
   }), { revenue: 0, profit: 0, qty: 0 });
+
+  const categoryMonthRows = useMemo(() => {
+    const map = new Map();
+    agg.enrichedSales
+      .filter(s => monthKeyOf(s.date) === viewMonth)
+      .forEach(s => {
+        const cat = s.category || '미분류';
+        if (!map.has(cat)) map.set(cat, { category: cat, qty: 0, revenue: 0, profit: 0, productIds: new Set() });
+        const acc = map.get(cat);
+        acc.qty += Number(s.qty) || 0;
+        acc.revenue += s.revenue;
+        acc.profit += s.profit;
+        acc.productIds.add(s.productId);
+      });
+    return [...map.values()]
+      .map(r => ({ ...r, productCount: r.productIds.size }))
+      .sort((a, b) => b.revenue - a.revenue);
+  }, [agg, viewMonth]);
+
+  const productMonthRows = useMemo(() => {
+    const map = new Map();
+    monthSales.forEach(s => {
+      if (!map.has(s.productId)) {
+        map.set(s.productId, { productId: s.productId, productName: s.productName, category: s.category || '미분류', qty: 0, revenue: 0, profit: 0 });
+      }
+      const acc = map.get(s.productId);
+      acc.qty += Number(s.qty) || 0;
+      acc.revenue += s.revenue;
+      acc.profit += s.profit;
+    });
+    return [...map.values()].sort((a, b) => b.revenue - a.revenue);
+  }, [monthSales]);
 
   const availableMonths = useMemo(() => {
     const keys = new Set(agg.enrichedSales.map(s => monthKeyOf(s.date)).filter(Boolean));
@@ -578,92 +644,201 @@ function SalesTracker({ data, setData, agg }) {
     return [...keys].sort().reverse();
   }, [agg]);
 
+  const monthCategories = useMemo(() => {
+    const cats = new Set(data.products.map(p => p.category || '미분류'));
+    return ['전체', ...[...cats].sort((a, b) => a.localeCompare(b, 'ko'))];
+  }, [data.products]);
+
   const maxDayRevenue = dayRows.reduce((mx, [, v]) => Math.max(mx, v.revenue), 1);
+  const dayEntryCount = Object.values(dayQtys).filter(v => Number(v) > 0).length;
+  const dayEntryTotal = data.products.reduce((sum, p) => sum + (Number(dayQtys[p.id]) || 0), 0);
+
+  const thStyle = { padding: '8px 8px', color: 'var(--ink-50)', fontWeight: 500, whiteSpace: 'nowrap' };
+  const tdStyle = { padding: '8px 8px' };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
       {data.products.length === 0 ? (
         <EmptyState icon={TrendingUp} title="먼저 상품을 등록해주세요" desc="마진 계산기 탭에서 상품을 추가하면 판매 기록을 남길 수 있어요." />
       ) : (
-        <form onSubmit={submit} style={{ background: 'var(--paper)', border: '1px solid var(--ink-10)', borderRadius: 12, padding: 18, display: 'flex', flexDirection: 'column', gap: 14 }}>
-          <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--ink-80)' }}>일별 판매 기록 추가</div>
-          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-            <Field label="상품">
-              <select style={inputStyle} value={form.productId} onChange={e => setForm({ ...form, productId: e.target.value })}>
-                <option value="">선택하세요</option>
-                {data.products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-              </select>
-            </Field>
-            <Field label="판매일">
-              <input style={inputStyle} type="date" value={form.date} onChange={e => setForm({ ...form, date: e.target.value })} />
-            </Field>
-            <Field label="수량">
-              <input style={inputStyle} type="number" min="1" value={form.qty} onChange={e => setForm({ ...form, qty: e.target.value })} />
-            </Field>
+        <div style={{ background: 'var(--paper)', border: '1px solid var(--ink-10)', borderRadius: 12, padding: 18, display: 'flex', flexDirection: 'column', gap: 14 }}>
+          <div>
+            <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--ink-80)' }}>일별 판매 입력</div>
+            <div style={{ fontSize: 12, color: 'var(--ink-50)', marginTop: 4 }}>엑셀처럼 날짜를 고르고 상품별 판매 수량을 한 번에 입력하세요.</div>
           </div>
-          <Field label="메모 (선택)">
-            <input style={inputStyle} value={form.note} onChange={e => setForm({ ...form, note: e.target.value })} placeholder="예: 클레임 1건 발생" />
-          </Field>
-          <div><button type="submit" style={btnPrimary}><Plus size={15} />기록 추가</button></div>
-        </form>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+            <Field label="판매일">
+              <input style={{ ...inputStyle, width: 160 }} type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} />
+            </Field>
+            <div style={{ fontSize: 12, color: 'var(--ink-50)', paddingBottom: 8 }}>
+              입력 중: <strong style={{ color: 'var(--ink-70)' }}>{dayEntryCount}개 상품 · {dayEntryTotal}개 판매</strong>
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {productsByCategory.map(([cat, items]) => (
+              <div key={cat}>
+                <div style={{ fontSize: 12, fontWeight: 500, color: 'var(--ink-50)', marginBottom: 8 }}>{cat}</div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {items.map(p => (
+                    <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 10px', background: '#fff', border: '1px solid var(--ink-10)', borderRadius: 8 }}>
+                      <span style={{ flex: 1, fontSize: 13, color: 'var(--ink-90)', minWidth: 0 }}>{p.name}</span>
+                      <span style={{ fontSize: 12, color: 'var(--ink-40)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtWon(p.sellPrice)}</span>
+                      <input
+                        style={{ ...inputStyle, width: 72, textAlign: 'right', fontFamily: 'var(--mono)' }}
+                        type="number" min="0" placeholder="0"
+                        value={dayQtys[p.id] ?? ''}
+                        onChange={e => setDayQtys(q => ({ ...q, [p.id]: e.target.value }))}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div>
+            <button type="button" onClick={saveDayEntry} style={btnPrimary}><Check size={15} />{entryDate} 판매 저장</button>
+          </div>
+        </div>
       )}
 
       <div>
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
           <h3 style={{ fontSize: 14, fontWeight: 500, color: 'var(--ink-70)', margin: 0 }}>월별 현황</h3>
-          <select style={{ ...inputStyle, width: 'auto' }} value={viewMonth} onChange={e => setViewMonth(e.target.value)}>
-            {availableMonths.map(m => <option key={m} value={m}>{monthLabel(m)}</option>)}
-          </select>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <select style={{ ...inputStyle, width: 'auto' }} value={viewMonth} onChange={e => { setViewMonth(e.target.value); setExpandedDay(null); }}>
+              {availableMonths.map(m => <option key={m} value={m}>{monthLabel(m)}</option>)}
+            </select>
+            <select style={{ ...inputStyle, width: 'auto' }} value={categoryFilter} onChange={e => setCategoryFilter(e.target.value)}>
+              {monthCategories.map(c => <option key={c} value={c}>{c === '전체' ? '전체 카테고리' : c}</option>)}
+            </select>
+          </div>
         </div>
 
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(120px, 1fr))', gap: 10, marginBottom: 18 }}>
           <StatCard label="이 달 매출" value={fmtWon(monthTotals.revenue)} />
           <StatCard label="이 달 순이익" value={fmtWon(monthTotals.profit)} tone={monthTotals.profit < 0 ? 'bad' : 'good'} />
-          <StatCard label="이 달 판매 건수" value={monthTotals.qty + '건'} />
+          <StatCard label="이 달 판매 수량" value={monthTotals.qty + '개'} />
         </div>
+
+        <h4 style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-60)', margin: '0 0 8px' }}>카테고리별 매출</h4>
+        {categoryMonthRows.length === 0 ? (
+          <EmptyState icon={Package} title="이 달 카테고리 매출이 없어요" desc="일별 판매를 입력하면 카테고리별로 합산돼요." />
+        ) : (
+          <div style={{ overflowX: 'auto', marginBottom: 20 }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr style={{ borderBottom: '1px solid var(--ink-10)' }}>
+                  {['카테고리', '판매 상품', '판매 수량', '매출', '순이익'].map(h => (
+                    <th key={h} style={{ ...thStyle, textAlign: ['판매 수량', '매출', '순이익', '판매 상품'].includes(h) ? 'right' : 'left' }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {categoryMonthRows.map(r => (
+                  <tr key={r.category} style={{ borderBottom: '1px solid var(--ink-5)' }}>
+                    <td style={{ ...tdStyle, color: 'var(--ink-90)', fontWeight: 500 }}>{r.category}</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)' }}>{r.productCount}개</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)' }}>{r.qty}개</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtWon(r.revenue)}</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)', color: r.profit < 0 ? 'var(--red)' : 'var(--green)' }}>{fmtWon(r.profit)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <h4 style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-60)', margin: '0 0 8px' }}>상품별 매출</h4>
+        {productMonthRows.length === 0 ? (
+          <EmptyState icon={ListChecks} title="이 달 상품별 매출이 없어요" desc="일별 판매를 입력해보세요." />
+        ) : (
+          <div style={{ overflowX: 'auto', marginBottom: 20 }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <thead>
+                <tr style={{ borderBottom: '1px solid var(--ink-10)' }}>
+                  {['카테고리', '상품', '판매 수량', '매출', '순이익'].map(h => (
+                    <th key={h} style={{ ...thStyle, textAlign: ['판매 수량', '매출', '순이익'].includes(h) ? 'right' : 'left' }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {productMonthRows.map(r => (
+                  <tr key={r.productId} style={{ borderBottom: '1px solid var(--ink-5)' }}>
+                    <td style={{ ...tdStyle, color: 'var(--ink-50)' }}>{r.category}</td>
+                    <td style={{ ...tdStyle, color: 'var(--ink-90)' }}>{r.productName}</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)' }}>{r.qty}개</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtWon(r.revenue)}</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)', color: r.profit < 0 ? 'var(--red)' : 'var(--green)' }}>{fmtWon(r.profit)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
 
         <h4 style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-60)', margin: '0 0 8px' }}>일별 매출 ({dayRows.length}일)</h4>
         {dayRows.length === 0 ? (
-          <EmptyState icon={Calendar} title="이 달 판매 기록이 없어요" desc="위에서 판매 건을 입력하면 날짜별로 합산돼요." />
+          <EmptyState icon={Calendar} title="이 달 판매 기록이 없어요" desc="위에서 날짜별 판매 수량을 입력하면 일 매출로 합산돼요." />
         ) : (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 20 }}>
-            {dayRows.map(([date, v]) => (
-              <div key={date} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, padding: '8px 10px', background: '#fff', border: '1px solid var(--ink-10)', borderRadius: 8 }}>
-                <span style={{ width: 50, color: 'var(--ink-50)', fontFamily: 'var(--mono)' }}>{dayLabelOf(date)}</span>
-                <div style={{ flex: 1, height: 6, background: 'var(--ink-5)', borderRadius: 3, overflow: 'hidden' }}>
-                  <div style={{ height: '100%', background: 'var(--ink-30)', width: `${Math.min(100, (v.revenue / maxDayRevenue) * 100)}%` }} />
+            {dayRows.map(([date, v]) => {
+              const isOpen = expandedDay === date;
+              const dayDetails = monthSales.filter(s => s.date === date);
+              return (
+                <div key={date}>
+                  <div
+                    onClick={() => setExpandedDay(isOpen ? null : date)}
+                    style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 13, padding: '8px 10px', background: '#fff', border: '1px solid var(--ink-10)', borderRadius: isOpen ? '8px 8px 0 0' : 8, cursor: 'pointer' }}
+                  >
+                    <span style={{ width: 50, color: 'var(--ink-50)', fontFamily: 'var(--mono)' }}>{dayLabelOf(date)}</span>
+                    <div style={{ flex: 1, height: 6, background: 'var(--ink-5)', borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', background: 'var(--ink-30)', width: `${Math.min(100, (v.revenue / maxDayRevenue) * 100)}%` }} />
+                    </div>
+                    <span style={{ fontFamily: 'var(--mono)', minWidth: 90, textAlign: 'right' }}>{fmtWon(v.revenue)}</span>
+                    <span style={{ fontFamily: 'var(--mono)', minWidth: 90, textAlign: 'right', color: v.profit < 0 ? 'var(--red)' : 'var(--green)' }}>{fmtWon(v.profit)}</span>
+                    <span style={{ color: 'var(--ink-40)', minWidth: 48, textAlign: 'right' }}>{v.qty}개</span>
+                    {isOpen ? <ChevronUp size={14} color="var(--ink-40)" /> : <ChevronDown size={14} color="var(--ink-40)" />}
+                  </div>
+                  {isOpen && (
+                    <div style={{ border: '1px solid var(--ink-10)', borderTop: 'none', borderRadius: '0 0 8px 8px', background: 'var(--ink-5)', padding: '8px 10px' }}>
+                      {dayDetails.map(s => (
+                        <div key={s.id} style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 12, padding: '4px 0', color: 'var(--ink-70)' }}>
+                          <span>{s.category ? `[${s.category}] ` : ''}{s.productName} × {s.qty}</span>
+                          <span style={{ fontFamily: 'var(--mono)' }}>{fmtWon(s.revenue)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
-                <span style={{ fontFamily: 'var(--mono)', minWidth: 90, textAlign: 'right' }}>{fmtWon(v.revenue)}</span>
-                <span style={{ fontFamily: 'var(--mono)', minWidth: 90, textAlign: 'right', color: v.profit < 0 ? 'var(--red)' : 'var(--green)' }}>{fmtWon(v.profit)}</span>
-                <span style={{ color: 'var(--ink-40)', minWidth: 40, textAlign: 'right' }}>{v.qty}건</span>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
         <h4 style={{ fontSize: 13, fontWeight: 500, color: 'var(--ink-60)', margin: '0 0 8px' }}>판매 기록 상세 ({monthSales.length}건)</h4>
         {monthSales.length === 0 ? (
-          <EmptyState icon={ListChecks} title="판매 기록이 없어요" desc="위에서 판매 건을 입력해보세요." />
+          <EmptyState icon={ListChecks} title="판매 기록이 없어요" desc="일별 판매 입력에서 수량을 저장해보세요." />
         ) : (
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead>
                 <tr style={{ borderBottom: '1px solid var(--ink-10)' }}>
-                  {['날짜', '상품', '수량', '매출', '순이익', '메모', ''].map(h => (
-                    <th key={h} style={{ textAlign: ['매출', '순이익', '수량'].includes(h) ? 'right' : 'left', padding: '8px 8px', color: 'var(--ink-50)', fontWeight: 500, whiteSpace: 'nowrap' }}>{h}</th>
+                  {['날짜', '카테고리', '상품', '수량', '매출', '순이익', '메모', ''].map(h => (
+                    <th key={h} style={{ ...thStyle, textAlign: ['매출', '순이익', '수량'].includes(h) ? 'right' : 'left' }}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {monthSales.map(r => (
                   <tr key={r.id} style={{ borderBottom: '1px solid var(--ink-5)' }}>
-                    <td style={{ padding: '8px 8px', color: 'var(--ink-60)', whiteSpace: 'nowrap' }}>{r.date}</td>
-                    <td style={{ padding: '8px 8px', color: 'var(--ink-90)' }}>{r.productName}</td>
-                    <td style={{ padding: '8px 8px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{r.qty}</td>
-                    <td style={{ padding: '8px 8px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtWon(r.revenue)}</td>
-                    <td style={{ padding: '8px 8px', textAlign: 'right', fontFamily: 'var(--mono)', color: r.profit < 0 ? 'var(--red)' : 'var(--green)' }}>{fmtWon(r.profit)}</td>
-                    <td style={{ padding: '8px 8px', color: 'var(--ink-50)' }}>{r.note}</td>
-                    <td style={{ padding: '8px 8px' }}>
+                    <td style={{ ...tdStyle, color: 'var(--ink-60)', whiteSpace: 'nowrap' }}>{r.date}</td>
+                    <td style={{ ...tdStyle, color: 'var(--ink-50)' }}>{r.category || '미분류'}</td>
+                    <td style={{ ...tdStyle, color: 'var(--ink-90)' }}>{r.productName}</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)' }}>{r.qty}</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtWon(r.revenue)}</td>
+                    <td style={{ ...tdStyle, textAlign: 'right', fontFamily: 'var(--mono)', color: r.profit < 0 ? 'var(--red)' : 'var(--green)' }}>{fmtWon(r.profit)}</td>
+                    <td style={{ ...tdStyle, color: 'var(--ink-50)' }}>{r.note}</td>
+                    <td style={{ ...tdStyle }}>
                       <button onClick={() => remove(r.id)} aria-label="삭제" style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--ink-30)', display: 'flex' }}><Trash2 size={14} /></button>
                     </td>
                   </tr>
@@ -912,8 +1087,8 @@ function AppShell({ data, setData, tab, setTab, saveError, isAnonymous, signInWi
       <style>{cssVars}</style>
       <header style={{ borderBottom: '1px solid var(--ink-10)', padding: '18px 20px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
         <div>
-          <div style={{ fontSize: 17, fontWeight: 600, color: 'var(--ink-90)', letterSpacing: '-0.01em' }}>쿠팡 위탁판매 관리장부</div>
-          <div style={{ fontSize: 12, color: 'var(--ink-50)' }}>마진 · 판매 · 소싱 · 이미지를 한 곳에서</div>
+          <div style={{ fontSize: 17, fontWeight: 600, color: 'var(--ink-90)', letterSpacing: '-0.01em' }}>에이프릴커머스 관리 장부</div>
+          <div style={{ fontSize: 12, color: 'var(--ink-50)' }}>April Commerce · 마진 · 판매 · 소싱 · 이미지</div>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           {saveError && <div style={{ fontSize: 12, color: 'var(--red)', display: 'flex', alignItems: 'center', gap: 4 }}><AlertCircle size={14} />저장 실패</div>}
