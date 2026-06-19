@@ -2,10 +2,14 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   LayoutDashboard, Calculator, TrendingUp, Search, Image as ImageIcon,
   Plus, Trash2, Pencil, X, Check, ChevronDown, ChevronUp, ExternalLink,
-  Package, ListChecks, AlertCircle, Calendar,
+  Package, ListChecks, AlertCircle, Calendar, Upload,
 } from 'lucide-react';
 import { useFirestoreStore } from './hooks/useFirestoreStore';
 import { uid } from './lib/data';
+import {
+  parseProductTable, parseSalesList, parseSalesMatrix,
+  applyProductImport, previewSalesImport, applySalesImport,
+} from './lib/import';
 
 // ---------- formatting ----------
 const fmtWon = (n) => Math.round(Number(n) || 0).toLocaleString('ko-KR') + '원';
@@ -31,41 +35,9 @@ function calcMargin({ sellPrice, supplyPrice, feeRate, shipping }) {
   return { feeAmount, profit, marginRate };
 }
 
-// parse a copy-pasted spreadsheet block (TSV from Google Sheets, or CSV)
-// expected columns (in order, header row optional):
-// 카테고리, 상품명, 공급가, 배송비, 판매가, 수수료(%), 소싱처링크
+// parse a copy-pasted spreadsheet block — see src/lib/import.js
 function parsePastedTable(text) {
-  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-  if (lines.length === 0) return { rows: [], errors: ['내용이 비어있어요.'] };
-  const delim = lines[0].includes('\t') ? '\t' : ',';
-  const rows = [];
-  const errors = [];
-  const numCell = (s) => {
-    if (s == null) return '';
-    const cleaned = String(s).replace(/[₩%,\s]/g, '');
-    if (cleaned === '' || cleaned === '-') return '';
-    const v = parseFloat(cleaned);
-    return isFinite(v) ? v : '';
-  };
-  lines.forEach((line, i) => {
-    const cells = line.split(delim).map(c => c.trim());
-    // skip header-ish rows
-    if (i === 0 && (cells[1] || '').includes('상품') && !numCell(cells[2])) return;
-    const [category, name, supplyPrice, shipping, sellPrice, fee, sourceUrl] = cells;
-    if (!name) { return; }
-    const sp = numCell(sellPrice);
-    if (sp === '') { errors.push(`"${name}" 행: 판매가를 읽을 수 없어요.`); return; }
-    rows.push({
-      category: category || '미분류',
-      name,
-      supplyPrice: numCell(supplyPrice) || 0,
-      shipping: numCell(shipping) || 0,
-      sellPrice: sp,
-      fee: numCell(fee) || 10.8,
-      sourceUrl: sourceUrl || '',
-    });
-  });
-  return { rows, errors };
+  return parseProductTable(text);
 }
 
 // ---------- shared UI ----------
@@ -1040,12 +1012,181 @@ function ImageGuide({ data, setData }) {
 }
 
 // =========================================================
+// TAB: DATA IMPORT (Excel migration)
+// =========================================================
+function DataImport({ data, setData }) {
+  const [productText, setProductText] = useState('');
+  const [productPreview, setProductPreview] = useState(null);
+  const [productMode, setProductMode] = useState('skip');
+
+  const [salesFormat, setSalesFormat] = useState('list');
+  const [salesText, setSalesText] = useState('');
+  const [salesPreview, setSalesPreview] = useState(null);
+  const [salesMode, setSalesMode] = useState('replace');
+  const [defaultYear, setDefaultYear] = useState(String(new Date().getFullYear()));
+
+  function previewProducts() {
+    setProductPreview(parseProductTable(productText));
+  }
+
+  function confirmProducts() {
+    if (!productPreview?.rows.length) return;
+    const result = applyProductImport(data, productPreview.rows, productMode);
+    setData({
+      ...data,
+      products: result.products,
+      categories: result.categories,
+    });
+    setProductText('');
+    setProductPreview(null);
+    alert(`상품 가져오기 완료\n추가 ${result.added}개 · 건너뜀 ${result.skipped}개${result.updated ? ` · 수정 ${result.updated}개` : ''}`);
+  }
+
+  function previewSales() {
+    const year = Number(defaultYear) || new Date().getFullYear();
+    const parsed = salesFormat === 'matrix'
+      ? parseSalesMatrix(salesText, year)
+      : parseSalesList(salesText, year);
+    const preview = previewSalesImport(parsed.rows, data.products);
+    setSalesPreview({ ...parsed, ...preview });
+  }
+
+  function confirmSales() {
+    if (!salesPreview?.rows.length) return;
+    if (salesPreview.unmatched.length > 0 && !window.confirm(
+      `등록되지 않은 상품 ${salesPreview.unmatched.length}개는 건너뜁니다.\n먼저 상품을 가져온 뒤 판매 기록을 가져오는 것을 권장해요.\n계속할까요?`,
+    )) return;
+    const result = applySalesImport(data, salesPreview.rows, data.products, salesMode);
+    setData(result.data);
+    setSalesText('');
+    setSalesPreview(null);
+    alert(`판매 기록 가져오기 완료\n${result.imported}건 · 수량 합계 ${result.totalQty}개`);
+  }
+
+  const panelStyle = { background: 'var(--paper)', border: '1px solid var(--ink-10)', borderRadius: 12, padding: 18, display: 'flex', flexDirection: 'column', gap: 12 };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+      <div style={{ background: 'var(--amber-bg)', border: '1px solid var(--amber-border)', borderRadius: 10, padding: '12px 14px', fontSize: 13, color: 'var(--ink-80)' }}>
+        <strong style={{ fontWeight: 500 }}>엑셀 → 사이트 마이그레이션</strong> — 엑셀/구글 시트에서 범위를 복사(Ctrl+C)한 뒤 아래에 붙여넣으세요. <strong>1. 상품</strong>을 먼저 가져온 다음 <strong>2. 판매 기록</strong>을 가져오세요.
+      </div>
+
+      <div style={panelStyle}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--ink-80)' }}>1. 상품 가져오기</div>
+          <div style={{ fontSize: 12, color: 'var(--ink-50)', marginTop: 4 }}>
+            열 순서: <strong>카테고리, 상품명, 공급가, 배송비, 판매가, 수수료(%), 소싱처링크</strong>
+          </div>
+        </div>
+        <textarea
+          style={{ ...inputStyle, minHeight: 100, fontFamily: 'var(--mono)', fontSize: 12, resize: 'vertical' }}
+          value={productText}
+          onChange={e => { setProductText(e.target.value); setProductPreview(null); }}
+          placeholder="생활용품	모던쿡 보관용기	5000	3000	12900	10.8	https://..."
+        />
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <button type="button" onClick={previewProducts} style={btnGhost} disabled={!productText.trim()}>미리보기</button>
+          <label style={{ fontSize: 12, color: 'var(--ink-60)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            중복 상품명
+            <select style={{ ...inputStyle, width: 'auto', padding: '6px 8px', fontSize: 12 }} value={productMode} onChange={e => setProductMode(e.target.value)}>
+              <option value="skip">건너뛰기</option>
+              <option value="update">덮어쓰기</option>
+            </select>
+          </label>
+          {productPreview?.rows.length > 0 && (
+            <button type="button" onClick={confirmProducts} style={btnPrimary}><Check size={15} />{productPreview.rows.length}개 상품 가져오기</button>
+          )}
+        </div>
+        {productPreview && (
+          <div style={{ fontSize: 12, color: 'var(--ink-60)' }}>
+            {productPreview.rows.length > 0 && <div style={{ color: 'var(--green)' }}>{productPreview.rows.length}개 인식 — {productPreview.rows.slice(0, 3).map(r => r.name).join(', ')}{productPreview.rows.length > 3 ? ' 외' : ''}</div>}
+            {productPreview.errors.map((e, i) => <div key={i} style={{ color: 'var(--red)' }}>{e}</div>)}
+          </div>
+        )}
+      </div>
+
+      <div style={panelStyle}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--ink-80)' }}>2. 판매 기록 가져오기</div>
+          <div style={{ fontSize: 12, color: 'var(--ink-50)', marginTop: 4 }}>상품명은 등록된 상품과 <strong>동일하게</strong> 적어야 매칭돼요.</div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {[
+            { key: 'list', label: '목록 형식 (날짜·상품·수량)' },
+            { key: 'matrix', label: '피벗 형식 (날짜×상품 표)' },
+          ].map(f => (
+            <button key={f.key} type="button" onClick={() => { setSalesFormat(f.key); setSalesPreview(null); }} style={{
+              ...btnGhost, padding: '6px 12px', fontSize: 12,
+              background: salesFormat === f.key ? 'var(--ink-90)' : 'transparent',
+              color: salesFormat === f.key ? '#fff' : 'var(--ink-60)',
+              borderColor: salesFormat === f.key ? 'var(--ink-90)' : 'var(--ink-15)',
+            }}>{f.label}</button>
+          ))}
+        </div>
+        {salesFormat === 'list' ? (
+          <div style={{ fontSize: 12, color: 'var(--ink-50)' }}>
+            열: <strong>날짜, 상품명, 수량</strong> (또는 날짜, 카테고리, 상품명, 수량) · 날짜 예: 2025-03-01, 3/1, 3월 1일
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: 'var(--ink-50)' }}>
+            1행: <strong>날짜, 상품A, 상품B, …</strong> · 2행부터: 날짜와 각 상품 판매 수량 (엑셀 피벗 시트 형태)
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+          <Field label="연도 없는 날짜 기본값">
+            <input style={{ ...inputStyle, width: 100 }} type="number" value={defaultYear} onChange={e => setDefaultYear(e.target.value)} />
+          </Field>
+          <label style={{ fontSize: 12, color: 'var(--ink-60)', display: 'flex', alignItems: 'center', gap: 6, paddingBottom: 8 }}>
+            기존 기록
+            <select style={{ ...inputStyle, width: 'auto', padding: '6px 8px', fontSize: 12 }} value={salesMode} onChange={e => setSalesMode(e.target.value)}>
+              <option value="replace">가져온 날짜 덮어쓰기</option>
+              <option value="merge">합산 추가</option>
+            </select>
+          </label>
+        </div>
+        <textarea
+          style={{ ...inputStyle, minHeight: 120, fontFamily: 'var(--mono)', fontSize: 12, resize: 'vertical' }}
+          value={salesText}
+          onChange={e => { setSalesText(e.target.value); setSalesPreview(null); }}
+          placeholder={salesFormat === 'list'
+            ? '날짜\t상품명\t수량\n2025-03-01\t모던쿡 보관용기\t3\n2025-03-01\t3단 우산\t2'
+            : '날짜\t모던쿡 보관용기\t3단 우산\n2025-03-01\t3\t2\n2025-03-02\t1\t0'}
+        />
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          <button type="button" onClick={previewSales} style={btnGhost} disabled={!salesText.trim()}>미리보기</button>
+          {salesPreview?.rows.length > 0 && (
+            <button type="button" onClick={confirmSales} style={btnPrimary} disabled={!salesPreview.matched.length}>
+              <Check size={15} />{salesPreview.matched.length}건 가져오기
+            </button>
+          )}
+        </div>
+        {salesPreview && (
+          <div style={{ fontSize: 12, color: 'var(--ink-60)', display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div style={{ color: salesPreview.matched.length ? 'var(--green)' : 'var(--red)' }}>
+              인식 {salesPreview.rows.length}행 · 매칭 {salesPreview.matched.length}건 · 수량 {salesPreview.totalQty}개
+              {salesPreview.dateRange && ` · ${salesPreview.dateRange.from} ~ ${salesPreview.dateRange.to}`}
+            </div>
+            {salesPreview.unmatched.length > 0 && (
+              <div style={{ color: 'var(--red)' }}>
+                미등록 상품 ({salesPreview.unmatched.length}): {salesPreview.unmatched.slice(0, 5).join(', ')}{salesPreview.unmatched.length > 5 ? ' 외' : ''}
+              </div>
+            )}
+            {salesPreview.errors?.map((e, i) => <div key={i} style={{ color: 'var(--amber)' }}>{e}</div>)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// =========================================================
 // APP SHELL
 // =========================================================
 const TABS = [
   { key: 'dashboard', label: '대시보드', icon: LayoutDashboard },
   { key: 'margin', label: '마진 계산기', icon: Calculator },
   { key: 'sales', label: '판매 현황', icon: TrendingUp },
+  { key: 'import', label: '데이터 가져오기', icon: Upload },
   { key: 'sourcing', label: '상품 소싱', icon: Search },
   { key: 'image', label: '이미지 가이드', icon: ImageIcon },
 ];
@@ -1115,6 +1256,7 @@ function AppShell({ data, setData, tab, setTab, saveError, isAnonymous, signInWi
         {tab === 'dashboard' && <Dashboard data={data} setTab={setTab} agg={agg} />}
         {tab === 'margin' && <MarginCalculator data={data} setData={setData} />}
         {tab === 'sales' && <SalesTracker data={data} setData={setData} agg={agg} />}
+        {tab === 'import' && <DataImport data={data} setData={setData} />}
         {tab === 'sourcing' && <Sourcing data={data} setData={setData} />}
         {tab === 'image' && <ImageGuide data={data} setData={setData} />}
       </main>
